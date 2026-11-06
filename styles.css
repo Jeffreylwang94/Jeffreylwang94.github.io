@@ -1,0 +1,10 @@
+/* Intentionally 1996. */
+body {
+    background: #c0c0c0;
+    color: #000;
+    font-family: "Times New Roman", Times, serif;
+    margin: 8px;
+}
+a { color: #0000ee; }
+a:visited { color: #551a8b; }
+a:active { color: #ff0000; }

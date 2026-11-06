@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>Reaction–Diffusion</title>
+    <meta name="description" content="A GPU-powered reaction-diffusion simulation running entirely in your browser.">
+    <link rel="stylesheet" href="../styles.css">
+    <style>
+        .rd-stage {
+            width: 100%;
+            max-width: 960px;
+            aspect-ratio: 5 / 3;
+            background: #0b0f1a;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .rd-stage canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: crosshair;
+            touch-action: none;
+        }
+        .rd-fallback {
+            color: #eee;
+            padding: 1rem;
+        }
+        .rd-controls {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.75rem 1rem;
+            max-width: 960px;
+            margin: 0.75rem 0;
+        }
+        .rd-stats {
+            font: 0.85rem ui-monospace, Menlo, Consolas, monospace;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Reaction–Diffusion</h1>
+        <p>Two imaginary chemicals spread out and react with each other. Out of that simple rule come coral,
+            fingerprints, cells that divide, and mazes. Click and drag to add some chemical yourself.</p>
+    </header>
+
+    <main>
+        <section>
+            <div class="rd-stage" id="stage">
+                <canvas id="sim"></canvas>
+            </div>
+
+            <div class="rd-controls">
+                <label>Pattern
+                    <select id="preset">
+                        <option value="0.0545,0.062">Coral</option>
+                        <option value="0.0367,0.0649">Mitosis</option>
+                        <option value="0.029,0.057">Maze</option>
+                        <option value="0.037,0.06">Fingerprint</option>
+                        <option value="0.035,0.065">Spots</option>
+                        <option value="0.014,0.045">Waves</option>
+                    </select>
+                </label>
+                <label>Colors
+                    <select id="palette">
+                        <option value="ink">Ink</option>
+                        <option value="ember">Ember</option>
+                        <option value="moss">Moss</option>
+                        <option value="paper">Paper</option>
+                    </select>
+                </label>
+                <label>Speed
+                    <input id="speed" type="range" min="1" max="40" value="12">
+                </label>
+                <button id="pause" type="button">Pause</button>
+                <button id="reseed" type="button">Reseed</button>
+                <button id="clear" type="button">Clear</button>
+            </div>
+            <p id="stats" class="rd-stats"></p>
+        </section>
+
+        <section>
+            <h2>Wait, this is a static page?</h2>
+            <p>Yes. GitHub sent your browser this one HTML file, the same file everyone else gets, and then
+                stepped out of the picture. Everything after that happens on your own machine:</p>
+            <ul>
+                <li>The whole grid lives in your graphics card's memory as a texture.</li>
+                <li>A small WebGL shader program updates every cell in parallel, many times per frame.
+                    The counter above shows how much work that adds up to.</li>
+                <li>No server, no libraries, no build step. View the page source and the whole thing is there.</li>
+            </ul>
+            <p>The math is the <a href="https://en.wikipedia.org/wiki/Reaction%E2%80%93diffusion_system">Gray–Scott model</a>.
+                Chemical A is constantly fed in, chemical B is constantly removed, and wherever they meet, B
+                converts A into more B. Nudging the feed and removal rates, which is what each "Pattern" does,
+                changes the whole character of the result.</p>
+        </section>
+    </main>
+
+    <footer>
+        <p>
+            <a href="../index.html">Back to Home</a>
+        </p>
+    </footer>
+
+    <script>
+    (function () {
+        const stage = document.getElementById('stage');
+        const canvas = document.getElementById('sim');
+        const statsEl = document.getElementById('stats');
+        const fail = (msg) => { stage.innerHTML = '<p class="rd-fallback">' + msg + '</p>'; };
+
+        const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+        if (!gl) return fail("Your browser doesn't support WebGL2, so the simulation can't run here.");
+        if (!gl.getExtension('EXT_color_buffer_float')) {
+            return fail("Your graphics driver can't render to float textures, so the simulation can't run here.");
+        }
+
+        // One simulation cell per canvas pixel; the browser scales the canvas to fit.
+        const W = Math.min(960, Math.max(320, Math.round(stage.clientWidth)));
+        const H = Math.round(W * 3 / 5);
+        canvas.width = W;
+        canvas.height = H;
+
+        // ---- Shaders ----------------------------------------------------------
+
+        const VERT = `#version 300 es
+            layout(location = 0) in vec2 a_pos;
+            out vec2 v_uv;
+            void main() {
+                v_uv = a_pos * 0.5 + 0.5;
+                gl_Position = vec4(a_pos, 0.0, 1.0);
+            }`;
+
+        // One Gray-Scott step. R = chemical A, G = chemical B.
+        const SIM = `#version 300 es
+            precision highp float;
+            uniform sampler2D u_state;
+            uniform vec2 u_texel;
+            uniform float u_feed;
+            uniform float u_kill;
+            uniform vec3 u_brush;   // xy = position (uv), z = radius (fraction of height), 0 = off
+            uniform float u_aspect;
+            in vec2 v_uv;
+            out vec4 outColor;
+
+            vec2 at(float dx, float dy) {
+                return texture(u_state, v_uv + vec2(dx, dy) * u_texel).rg;
+            }
+
+            void main() {
+                vec2 c = at(0.0, 0.0);
+                vec2 lap = -c
+                    + 0.2  * (at(1.0, 0.0) + at(-1.0, 0.0) + at(0.0, 1.0) + at(0.0, -1.0))
+                    + 0.05 * (at(1.0, 1.0) + at(-1.0, 1.0) + at(1.0, -1.0) + at(-1.0, -1.0));
+
+                float a = c.r;
+                float b = c.g;
+                float abb = a * b * b;
+                float na = a + (1.0 * lap.r - abb + u_feed * (1.0 - a));
+                float nb = b + (0.5 * lap.g + abb - (u_kill + u_feed) * b);
+
+                if (u_brush.z > 0.0) {
+                    vec2 d = (v_uv - u_brush.xy) * vec2(u_aspect, 1.0);
+                    if (length(d) < u_brush.z) nb = 0.9;
+                }
+
+                outColor = vec4(clamp(na, 0.0, 1.0), clamp(nb, 0.0, 1.0), 0.0, 1.0);
+            }`;
+
+        // Map chemical B to a color ramp, with a little fake lighting from its slope.
+        const DISPLAY = `#version 300 es
+            precision highp float;
+            uniform sampler2D u_state;
+            uniform vec2 u_texel;
+            uniform vec3 u_pal[4];
+            in vec2 v_uv;
+            out vec4 outColor;
+
+            vec3 ramp(float t) {
+                t = clamp(t, 0.0, 1.0) * 3.0;
+                if (t < 1.0) return mix(u_pal[0], u_pal[1], t);
+                if (t < 2.0) return mix(u_pal[1], u_pal[2], t - 1.0);
+                return mix(u_pal[2], u_pal[3], t - 2.0);
+            }
+
+            void main() {
+                float b  = texture(u_state, v_uv).g;
+                float bx = texture(u_state, v_uv + vec2(u_texel.x, 0.0)).g - texture(u_state, v_uv - vec2(u_texel.x, 0.0)).g;
+                float by = texture(u_state, v_uv + vec2(0.0, u_texel.y)).g - texture(u_state, v_uv - vec2(0.0, u_texel.y)).g;
+                vec3 n = normalize(vec3(-bx * 8.0, -by * 8.0, 1.0));
+                float light = dot(n, normalize(vec3(-0.5, 0.5, 1.0)));
+                vec3 col = ramp(smoothstep(0.0, 0.35, b)) * mix(0.75, 1.1, light);
+                outColor = vec4(col, 1.0);
+            }`;
+
+        function compile(type, src) {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+            return s;
+        }
+
+        function program(fragSrc) {
+            const p = gl.createProgram();
+            gl.attachShader(p, compile(gl.VERTEX_SHADER, VERT));
+            gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fragSrc));
+            gl.linkProgram(p);
+            if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+            return { prog: p, loc: (name) => gl.getUniformLocation(p, name) };
+        }
+
+        let sim, disp;
+        try {
+            sim = program(SIM);
+            disp = program(DISPLAY);
+        } catch (err) {
+            console.error(err);
+            return fail("The simulation's shaders failed to compile on this device.");
+        }
+
+        // One triangle that covers the whole screen.
+        gl.bindVertexArray(gl.createVertexArray());
+        gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+        // ---- Ping-pong state textures ------------------------------------------
+
+        function makeTarget() {
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, H, 0, gl.RGBA, gl.FLOAT, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);   // edges wrap around
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+            return { tex, fb };
+        }
+
+        let src = makeTarget();
+        let dst = makeTarget();
+        if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+            return fail("Your graphics driver can't render to float textures, so the simulation can't run here.");
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+        // Fill with chemical A everywhere, plus some random blobs of B.
+        function seed(blobs) {
+            const data = new Float32Array(W * H * 4);
+            for (let i = 0; i < W * H; i++) {
+                data[i * 4] = 1;
+                data[i * 4 + 3] = 1;
+            }
+            for (let n = 0; n < blobs; n++) {
+                const cx = Math.random() * W;
+                const cy = Math.random() * H;
+                const r = 4 + Math.random() * 10;
+                for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
+                    for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
+                        if ((x - cx) ** 2 + (y - cy) ** 2 > r * r) continue;
+                        const j = ((((y % H) + H) % H) * W + (((x % W) + W) % W)) * 4;
+                        data[j] = 0.5;
+                        data[j + 1] = 1;
+                    }
+                }
+            }
+            gl.bindTexture(gl.TEXTURE_2D, src.tex);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.FLOAT, data);
+        }
+
+        // ---- Controls ------------------------------------------------------------
+
+        const PALETTES = {
+            ink:   ['#0b0f1a', '#1b3a6b', '#4fa3d1', '#f2f7ff'],
+            ember: ['#120806', '#6b1d0e', '#e0622a', '#ffe2a8'],
+            moss:  ['#0c1410', '#214d34', '#7bb36b', '#eef5d6'],
+            paper: ['#fbfaf7', '#c9c4ba', '#5a554d', '#141210'],
+        };
+        const hexToRgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+
+        const state = {
+            feed: 0.0545,
+            kill: 0.062,
+            steps: 12,
+            paused: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+            palette: PALETTES.ink.flatMap(hexToRgb),
+            brush: { x: 0, y: 0, down: false },
+        };
+
+        const pauseBtn = document.getElementById('pause');
+        const syncPause = () => { pauseBtn.textContent = state.paused ? 'Play' : 'Pause'; };
+        syncPause();
+
+        document.getElementById('preset').addEventListener('change', (e) => {
+            [state.feed, state.kill] = e.target.value.split(',').map(Number);
+        });
+        document.getElementById('palette').addEventListener('change', (e) => {
+            state.palette = PALETTES[e.target.value].flatMap(hexToRgb);
+            stage.style.background = PALETTES[e.target.value][0];
+        });
+        document.getElementById('speed').addEventListener('input', (e) => {
+            state.steps = Number(e.target.value);
+        });
+        pauseBtn.addEventListener('click', () => { state.paused = !state.paused; syncPause(); });
+        document.getElementById('reseed').addEventListener('click', () => seed(40));
+        document.getElementById('clear').addEventListener('click', () => seed(0));
+
+        function moveBrush(e) {
+            const r = canvas.getBoundingClientRect();
+            state.brush.x = (e.clientX - r.left) / r.width;
+            state.brush.y = 1 - (e.clientY - r.top) / r.height;
+        }
+        canvas.addEventListener('pointerdown', (e) => {
+            canvas.setPointerCapture(e.pointerId);
+            state.brush.down = true;
+            moveBrush(e);
+        });
+        canvas.addEventListener('pointermove', moveBrush);
+        canvas.addEventListener('pointerup', () => { state.brush.down = false; });
+        canvas.addEventListener('pointercancel', () => { state.brush.down = false; });
+
+        // ---- Main loop -------------------------------------------------------------
+
+        gl.viewport(0, 0, W, H);
+        gl.useProgram(sim.prog);
+        gl.uniform2f(sim.loc('u_texel'), 1 / W, 1 / H);
+        gl.uniform1f(sim.loc('u_aspect'), W / H);
+        gl.useProgram(disp.prog);
+        gl.uniform2f(disp.loc('u_texel'), 1 / W, 1 / H);
+
+        function simulate(steps) {
+            const b = state.brush;
+            gl.useProgram(sim.prog);
+            gl.uniform1f(sim.loc('u_feed'), state.feed);
+            gl.uniform1f(sim.loc('u_kill'), state.kill);
+            gl.uniform3f(sim.loc('u_brush'), b.x, b.y, b.down ? 0.025 : 0);
+            for (let i = 0; i < steps; i++) {
+                gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb);
+                gl.bindTexture(gl.TEXTURE_2D, src.tex);
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+                [src, dst] = [dst, src];
+            }
+        }
+
+        function render() {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.useProgram(disp.prog);
+            gl.uniform3fv(disp.loc('u_pal'), state.palette);
+            gl.bindTexture(gl.TEXTURE_2D, src.tex);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+        }
+
+        let frames = 0;
+        let cellUpdates = 0;
+        let lastStats = performance.now();
+
+        function frame(now) {
+            if (!state.paused) {
+                simulate(state.steps);
+                cellUpdates += W * H * state.steps;
+            } else if (state.brush.down) {
+                simulate(1);   // let painting show up while paused
+            }
+            render();
+            frames++;
+
+            if (now - lastStats > 500) {
+                const secs = (now - lastStats) / 1000;
+                const fps = Math.round(frames / secs);
+                const perSec = cellUpdates / secs;
+                statsEl.textContent = `${W} × ${H} grid · ${state.steps} steps/frame · ${fps} fps · ` +
+                    (state.paused ? 'paused' : `≈ ${Math.round(perSec / 1e6).toLocaleString()} million cell updates/sec on your GPU`);
+                frames = 0;
+                cellUpdates = 0;
+                lastStats = now;
+            }
+            requestAnimationFrame(frame);
+        }
+
+        seed(40);
+        requestAnimationFrame(frame);
+    })();
+    </script>
+</body>
+</html>
